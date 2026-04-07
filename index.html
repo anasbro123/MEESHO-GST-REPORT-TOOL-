@@ -1,0 +1,224 @@
+import streamlit as st
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+
+# =========================
+# CONFIG
+# =========================
+st.set_page_config(
+    page_title="Meesho GST Report Tool",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 Meesho GST Report Tool")
+st.write("Upload your Meesho Sales & Return files to generate GST reports 🚀")
+
+# =========================
+# FILE UPLOAD
+# =========================
+sales_file = st.file_uploader("Upload Sales File", type=["xlsx", "xls", "csv"])
+return_file = st.file_uploader("Upload Return File", type=["xlsx", "xls", "csv"])
+
+REQUIRED_COLS = ["end_customer_state_new", "total_taxable_sale_value", "gst_rate"]
+
+# =========================
+# HELPERS
+# =========================
+def read_file(file):
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file)
+    return pd.read_excel(file, engine="openpyxl")
+
+def round_df(df):
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].round(2)
+    return df
+
+def clean_state(df):
+    df["end_customer_state_new"] = (
+        df["end_customer_state_new"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"NAN": "UNKNOWN", "": "UNKNOWN"})
+    )
+    return df
+
+def normalize_gst(series):
+    s = pd.to_numeric(series.astype(str).str.replace("%", ""), errors="coerce").fillna(0)
+
+    def map_rate(x):
+        if x == 5:
+            return 5
+        elif x == 18:
+            return 18
+        else:
+            return 0
+
+    return s.apply(map_rate)
+
+def validate(df, name):
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        st.error(f"{name} missing columns: {missing}")
+        st.stop()
+
+def detect_month(df):
+    for col in df.columns:
+        if "date" in col.lower():
+            try:
+                return pd.to_datetime(df[col], errors="coerce").dt.strftime("%b %Y").mode()[0]
+            except:
+                pass
+    return "Unknown"
+
+def make_summary(sales, returns):
+    s = sales.groupby("end_customer_state_new")["total_taxable_sale_value"].sum().reset_index()
+    r = returns.groupby("end_customer_state_new")["total_taxable_sale_value"].sum().reset_index()
+
+    s.columns = ["State", "Sales Value"]
+    r.columns = ["State", "Return Value"]
+
+    df = pd.merge(s, r, on="State", how="outer").fillna(0)
+    df["Net Value"] = df["Sales Value"] - df["Return Value"]
+
+    return df.sort_values("State").reset_index(drop=True)
+
+def gst_summary(sales, returns):
+    s = sales.groupby("gst_rate")["total_taxable_sale_value"].sum().reset_index()
+    r = returns.groupby("gst_rate")["total_taxable_sale_value"].sum().reset_index()
+
+    s.columns = ["GST Rate", "Sales Value"]
+    r.columns = ["GST Rate", "Return Value"]
+
+    df = pd.merge(s, r, on="GST Rate", how="outer").fillna(0)
+    df["Net Value"] = df["Sales Value"] - df["Return Value"]
+
+    all_rates = pd.DataFrame({"GST Rate": [0, 5, 18]})
+    df = pd.merge(all_rates, df, on="GST Rate", how="left").fillna(0)
+
+    df["GST Rate"] = df["GST Rate"].astype(int).astype(str) + "%"
+    return df
+
+def slab_report(sales, returns, rate):
+    s = sales[sales["gst_rate"] == rate]
+    r = returns[returns["gst_rate"] == rate]
+
+    if s.empty and r.empty:
+        return pd.DataFrame()
+
+    s = s.groupby("end_customer_state_new")["total_taxable_sale_value"].sum().reset_index()
+    r = r.groupby("end_customer_state_new")["total_taxable_sale_value"].sum().reset_index()
+
+    s.columns = ["State", "Sales Value"]
+    r.columns = ["State", "Return Value"]
+
+    df = pd.merge(s, r, on="State", how="outer").fillna(0)
+    df["Net Value"] = df["Sales Value"] - df["Return Value"]
+
+    return df.sort_values("State").reset_index(drop=True)
+
+def to_excel(main, gst, slabs):
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        round_df(main).to_excel(writer, index=False, sheet_name="State Summary")
+        round_df(gst).to_excel(writer, index=False, sheet_name="GST Summary")
+
+        for rate, df in slabs.items():
+            name = f"{rate}% GST"
+            if df.empty:
+                pd.DataFrame({"Message": [f"No data for {rate}%"]}).to_excel(writer, index=False, sheet_name=name)
+            else:
+                round_df(df).to_excel(writer, index=False, sheet_name=name)
+
+    return output.getvalue()
+
+# =========================
+# MAIN LOGIC
+# =========================
+if sales_file and return_file:
+
+    sales = read_file(sales_file)
+    returns = read_file(return_file)
+
+    validate(sales, "Sales File")
+    validate(returns, "Return File")
+
+    sales = clean_state(sales)
+    returns = clean_state(returns)
+
+    sales["total_taxable_sale_value"] = pd.to_numeric(sales["total_taxable_sale_value"], errors="coerce").fillna(0)
+    returns["total_taxable_sale_value"] = pd.to_numeric(returns["total_taxable_sale_value"], errors="coerce").fillna(0)
+
+    sales["gst_rate"] = normalize_gst(sales["gst_rate"])
+    returns["gst_rate"] = normalize_gst(returns["gst_rate"])
+
+    # Month detection
+    month_sales = detect_month(sales)
+    month_return = detect_month(returns)
+
+    if month_sales != month_return:
+        st.warning(f"⚠️ Sales ({month_sales}) and Return ({month_return}) months differ!")
+
+    final = make_summary(sales, returns)
+    gst = gst_summary(sales, returns)
+
+    slabs = {
+        0: slab_report(sales, returns, 0),
+        5: slab_report(sales, returns, 5),
+        18: slab_report(sales, returns, 18)
+    }
+
+    total_sales = final["Sales Value"].sum()
+    total_returns = final["Return Value"].sum()
+    net_sales = final["Net Value"].sum()
+
+    # ================= UI =================
+    st.success("✅ Report Generated Successfully!")
+
+    st.subheader("📊 Final State-wise Report")
+    st.dataframe(round_df(final), use_container_width=True)
+
+    st.subheader("📌 Summary")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Sales", f"₹ {total_sales:,.2f}")
+    c2.metric("Total Returns", f"₹ {total_returns:,.2f}")
+    c3.metric("Net Sales", f"₹ {net_sales:,.2f}")
+
+    # TOP STATES
+    st.subheader("🏆 Top 5 States by Sales")
+    top_states = final.sort_values("Sales Value", ascending=False).head(5)
+    st.dataframe(round_df(top_states), use_container_width=True)
+
+    st.subheader("📊 GST Rate Summary")
+    st.dataframe(round_df(gst), use_container_width=True)
+
+    st.subheader("📍 GST Slab Reports")
+
+    for rate in [0, 5, 18]:
+        st.markdown(f"### 🔹 {rate}% GST")
+        df = slabs[rate]
+
+        if df.empty:
+            st.info("No data available")
+        else:
+            st.dataframe(round_df(df), use_container_width=True)
+
+    # DOWNLOAD
+    today = datetime.now().strftime("%d-%b-%Y")
+    excel = to_excel(final, gst, slabs)
+
+    st.download_button(
+        "⬇ Download Excel Report",
+        data=excel,
+        file_name=f"Meesho_GST_Report_{today}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+else:
+    st.warning("⬆ Upload both files to generate report")
